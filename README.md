@@ -7,7 +7,7 @@ A production-ready machine learning system for accurate photovoltaic power predi
 
 - **Multi-model PV Power Prediction** (Random Forest, LightGBM, XGBoost)
 - **Advanced Feature Engineering** with weather and temporal features  
-- **Time Series Validation** with proper train-test splits
+- **Time Series Validation** with proper train-test splits (specifically, try to avoid time leakage)/ try prediction with online learning 
 - **Model Performance Tracking** with MLflow
 - **REST API** for real-time predictions
 
