@@ -1,0 +1,6 @@
+microgrid_pv_production/
+├── src/                 # Source code
+├── config/             # Configuration files
+├── scripts/            # Execution scripts
+├── tests/              # Test cases
+└── requirements.txt    # Dependencies
