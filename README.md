@@ -22,7 +22,7 @@ A production-ready machine learning system for accurate photovoltaic power predi
 ## 🛠️ Quick Start
 
 ```bash
-git clone https://github.com/yourusername/microgrid_pv_production.git
+git clone https://github.com/sowsowiamme/microgrid_pv_production.git
 cd microgrid_pv_production
 pip install -r requirements.txt
 python scripts/train_pv_model.py
