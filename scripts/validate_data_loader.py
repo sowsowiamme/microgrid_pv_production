@@ -5,6 +5,7 @@ import logging
 
 # 添加src目录到Python路径
 sys.path.append('src')
+from src.model.model_trainer import ModelTrainer
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,25 +17,26 @@ from src.data.loaders import DataLoader
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def validate_data_loader():
+def validate_data_loader(test_data=False):
     """使用真实数据验证DataLoader"""
 
     # 初始化DataLoader
     data_loader = DataLoader(
         daily_points=24,
         time_column='time',
-        target_columns=['pv_production', 'consumption']  # 根据你的数据调整
+        target_columns=['pv_production']
     )
 
     try:
-        # put your own file path
-        file_path = '/Users/sowsow/Documents/2024 job finding/3. Rye微电网数据集/rye-ai-hackathon/data/train.csv'  # 替换为你的真实文件路径
-
+        if test_data:
+            file_path = os.path.join(project_root, 'data', 'raw', 'test.csv')
+        else:
+            file_path = os.path.join(project_root, 'data', 'raw', 'train.csv')
         print("开始验证 DataLoader...")
         print(f"数据文件: {file_path}")
 
         # 测试数据加载
-        print("\n1. 测试数据加载...")
+        print("\n1. 测试数据加载..., 在这一步筛选出具有完整24小时一天的数据，同时将date转换成index，做相应的时间转换")
         data = data_loader.load_data(file_path)
         print(f"数据加载成功! 形状: {data.shape}")
 
@@ -60,18 +62,21 @@ def validate_data_loader():
         print("\n5. 数据预览:")
         print(data.head())
 
+
         # 测试特征创建功能
         print("\n6. 测试时间特征创建...")
         data_with_features = data_loader.create_time_features(data)
         new_columns = set(data_with_features.columns) - set(data.columns)
-        print(f"✅ 新增特征列: {list(new_columns)}")
+        print(f" 新增特征列: {list(new_columns)}")
 
-        print("\n🎉 DataLoader 验证完成! 所有功能正常!")
-        return True
+        print("\n DataLoader 验证完成! 所有功能正常!")
+        return True, data_with_features
 
     except Exception as e:
         print(f"验证过程中出错: {str(e)}")
         return False
 
 if __name__ == "__main__":
-    validate_data_loader()
+    res, processed_dataset = validate_data_loader(test_data=False)
+    print(processed_dataset.head())
+    print(processed_dataset.shape)
