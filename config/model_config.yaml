@@ -1,0 +1,235 @@
+# model_config.yaml
+# config/model_config.yaml
+# 光伏产量预测模型配置
+# 项目: SolarPV_Forecasting
+
+# ===== 全局配置 =====
+global:
+  random_state: 42          # 随机种子，确保可复现性
+  n_jobs: -1                # 并行作业数 (-1 = 所有CPU核心)
+
+# ===== 训练配置 =====
+training:
+  cv_strategy: timeseries   # 交叉验证策略: 'timeseries' 或 'kfold'
+  cv_splits: 5              # 交叉验证折数 (时间序列建议5-10)
+  random_state: ${random_state}  # 仅当kfold时有效
+  scoring: neg_mean_squared_error  # 评分标准
+  n_jobs: -1        # 并行作业数
+  metrics:                  # 要计算的评估指标
+    - rmse
+    - mae
+    - r2
+    - mape
+
+# ===== 模型配置 =====
+models:
+  # 随机森林 - 稳健的基线模型
+  randomforest:
+    enabled: true
+    class: sklearn.ensemble.RandomForestRegressor
+    init_params:
+      random_state: ${random_state}
+      verbose: 0
+    param_grid:
+      n_estimators: [50, 100, 200]
+      max_depth: [5, 10, 15]       # 时间序列通常不需要很深
+      min_samples_split: [2, 5]
+      min_samples_leaf: [1, 2]
+      max_features: [0.5, 0.7, 1.0]
+
+  # 梯度提升 - 强大的集成方法
+  GradientBoosting:
+    enabled: true
+    class: sklearn.ensemble.GradientBoostingRegressor
+    init_params:
+      random_state: ${random_state}
+      verbose: 0
+    param_grid:
+      n_estimators: [50, 100, 200]
+      learning_rate: [0.01, 0.1, 0.2]
+      max_depth: [3, 5, 7]         # 限制深度防止过拟合
+      subsample: [0.8, 1.0]
+      min_samples_split: [2, 5]
+
+  # 岭回归 - L2正则化线性模型
+  ridge:
+    enabled: true
+    class: sklearn.linear_model.Ridge
+    init_params:
+      random_state: ${random_state}
+    param_grid:
+      alpha: [0.1, 1.0, 10.0, 100.0]
+      solver: ['auto']
+
+  # Lasso回归 - L1正则化（特征选择）
+  lasso:
+    enabled: True
+    class: sklearn.linear_model.Lasso
+    init_params:
+      random_state: ${random_state}
+      max_iter: 10000
+    param_grid:
+      alpha: [0.001, 0.01, 0.1, 1.0]
+      selection: ['cyclic', 'random']
+
+  # 支持向量机 - 适合小数据集
+  svr:
+    enabled: true  # 时间序列通常较慢，建议禁用
+    class: sklearn.svm.SVR
+    init_params: {}
+    param_grid:
+      C: [0.1, 1.0, 10.0]
+      kernel: ['rbf', 'linear']
+      gamma: ['scale', 'auto']
+      epsilon: [0.1, 0.2]
+
+  # K近邻 - 简单基线
+  KNN:
+    enabled: true  # 时间序列中通常表现不佳
+    class: sklearn.neighbors.KNeighborsRegressor
+    init_params: {}
+    param_grid:
+      n_neighbors: [3, 5, 7, 10]
+      weights: ['uniform', 'distance']
+      algorithm: ['auto']
+
+  # XGBoost - 高性能梯度提升
+  XGBoost:
+    enabled: true
+    class: xgboost.XGBRegressor
+    init_params:
+      random_state: ${random_state}
+      n_jobs: ${n_jobs}
+      objective: reg:squarederror
+      verbosity: 0
+      tree_method: 'hist'  # 更快的训练
+    param_grid:
+      n_estimators: [50, 100, 200]
+      max_depth: [3, 5, 7]
+      learning_rate: [0.01, 0.1, 0.2]
+      subsample: [0.8, 1.0]
+      colsample_bytree: [0.8, 1.0]
+      gamma: [0, 0.1, 0.2]
+
+  # LightGBM - 内存高效的梯度提升
+  LightGBM:
+    enabled: true
+    class: lightgbm.LGBMRegressor
+    init_params:
+      random_state: ${random_state}
+      n_jobs: ${n_jobs}
+      objective: 'regression'
+      verbose: -1
+    param_grid:
+      n_estimators: [50, 100, 200]
+      max_depth: [3, 5, 7]
+      learning_rate: [0.01, 0.1, 0.2]
+      num_leaves: [31, 50, 100]
+      min_child_samples: [5, 10, 20]
+      feature_fraction: [0.8, 1.0]
+
+  # 线性回归 - 简单基线
+  LinearRegression:
+    enabled: true
+    class: sklearn.linear_model.LinearRegression
+    init_params:
+      n_jobs: ${n_jobs}
+    param_grid: {}  # 无线性参数可调
+
+# ===== 高级选项 (可选) =====
+advanced:
+  feature_selection:
+    enabled: false
+    method: 'recursive_elimination'
+    n_features_to_select: 0.8  # 保留80%的特征
+
+  ensemble:
+    enabled: false
+    method: 'stacking'
+    meta_learner: 'Ridge'
+
+# ===== 记录配置 =====
+logging:
+  level: INFO
+  file: 'logs/training_${timestamp}.log'
+  console: true
+
+# models:
+#   RandomForest:
+#     enabled: true
+#     class: sklearn.ensemble.RandomForestRegressor
+#     init_params:
+#       random_state: 42
+#       n_jobs: -1
+#     param_grid:
+#       n_estimators: [50, 100, 200]
+#       max_depth: [10, 5, 3]
+#       min_samples_split: [2, 5]
+#       min_samples_leaf: [1, 2]
+
+#   GradientBoosting:
+#     enabled: true
+#     class: sklearn.ensemble.GradientBoostingRegressor
+#     init_params:
+#       random_state: 42
+#     param_grid:
+#       n_estimators: [50, 100, 200]
+#       learning_rate: [0.01, 0.1, 0.2]
+#       max_depth: [3, 5, 7]
+
+#   Ridge:
+#     enabled: true
+#     class: sklearn.linear_model.Ridge
+#     init_params:
+#       random_state: 42
+#     param_grid:
+#       alpha: [0.1, 1.0, 10.0, 100.0]
+
+#   Lasso:
+#     enabled: true
+#     class: sklearn.linear_model.Lasso
+#     init_params:
+#       random_state: 42
+#     param_grid:
+#       alpha: [0.1, 1.0, 10.0, 100.0]
+
+#   SVR:
+#     enabled: true
+#     class: sklearn.svm.SVR
+#     init_params: {}
+#     param_grid:
+#       C: [0.1, 1.0, 10.0]
+#       kernel: [linear, rbf]
+#       gamma: [scale, auto]
+
+#   KNN:
+#     enabled: true
+#     class: sklearn.neighbors.KNeighborsRegressor
+#     init_params: {}
+#     param_grid:
+#       n_neighbors: [3, 5, 7, 10]
+#       weights: [uniform, distance]
+
+#   XGBoost:
+#     enabled: true
+#     class: xgboost.XGBRegressor
+#     init_params:
+#       random_state: 42
+#       n_jobs: -1
+#     param_grid:
+#       n_estimators: [50, 100, 30]
+#       max_depth: [3, 5, 7]
+#       learning_rate: [0.01, 0.1, 0.2]
+#       subsample: [0.8, 1.0]
+
+#   LightGBM:
+#     enabled: true
+#     class: lightgbm.LGBMRegressor
+#     init_params:
+#       random_state: 42
+#       n_jobs: -1
+#     param_grid:
+#       n_estimators: [50, 100, 30]
+#       max_depth: [3, 5, 7]
+#       learning_rate: [0.01, 0.1]
+#       num_leaves: [31, 50, 100]
