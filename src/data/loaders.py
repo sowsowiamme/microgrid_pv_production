@@ -4,11 +4,6 @@ Handles proper time-based train/validation/test splits.
 """
 
 import pandas as pd
-from typing import Tuple
-from src.utils.config import config
-
-
-import pandas as pd
 import numpy as np
 from typing import Optional, Tuple, Dict, Any
 import logging
@@ -26,7 +21,7 @@ class DataLoader:
             time_column: Name of the time column in the dataset
             target_columns: List of target column names for prediction
         """
-        self.daily_points = daily_points
+        self.daily_points = daily_points # here, we have 24 points per day for hourly data, in other dataset, we could also have 1 point per 15 minutes
         self.time_column = time_column
         self.target_columns = target_columns or []
         self.logger = logging.getLogger(__name__)
@@ -165,9 +160,6 @@ class DataLoader:
         dataset_with_features['month'] = dataset.index.month
         dataset_with_features['day_of_year'] = dataset.index.dayofyear
 
-        # Cyclical encoding for time features
-        dataset_with_features['hour_sin'] = np.sin(2 * np.pi * dataset_with_features['hour'] / 24)
-        dataset_with_features['hour_cos'] = np.cos(2 * np.pi * dataset_with_features['hour'] / 24)
 
         self.logger.info("Added time-based features")
         return dataset_with_features
