@@ -58,6 +58,10 @@ class FeatureSelector:
         if self.target_column not in numeric_columns:
             numeric_columns.append(self.target_column)
 
+        # # depending on whether you can get a relatively real-time data
+        # numeric_columns = [col for col in numeric_columns if not 'lag' in col]
+
+        # copy a new dataframe with the numeric_columns
         numeric_data = data[numeric_columns].copy()
 
         # 计算相关性矩阵

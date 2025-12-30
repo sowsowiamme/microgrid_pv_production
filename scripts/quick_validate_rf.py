@@ -33,7 +33,8 @@ core_weather_features = ['global_rad:W',       # 全球辐射 (最重要！)
                              'pv_change_1h',
                              'global_rad_acceleration_1h']
 time_features = ['hour', 'day_of_year', 'day_of_week', 'month']
-selected_columns = core_weather_features + time_features
+lag_features = ['pv_production_lag_1', 'pv_production_lag_2', 'pv_production_lag_3', 'pv_production_lag_4', 'pv_production_lag_5', 'pv_production_lag_6', 'pv_production_lag_7', 'pv_production_lag_8', 'pv_production_lag_9', 'pv_production_lag_10', 'pv_production_lag_11', 'pv_production_lag_12', 'pv_production_lag_13', 'pv_production_lag_14', 'pv_production_lag_15', 'pv_production_lag_16', 'pv_production_lag_17', 'pv_production_lag_18', 'pv_production_lag_19', 'pv_production_lag_20', 'pv_production_lag_21', 'pv_production_lag_22', 'pv_production_lag_23', 'pv_production_lag_24']
+selected_columns = core_weather_features + time_features + lag_features
 
 X_train, X_test, y_train, y_test, selected_columns =modeltrainer.prepare_data(train_data, test_data, selected_columns, 'pv_production')
 # 设置日志
@@ -132,8 +133,21 @@ if __name__ == "__main__":
                              'pv_change_1h',
                              'global_rad_acceleration_1h']
     time_features = ['hour', 'day_of_year', 'day_of_week', 'month']
-    selected_columns = core_weather_features + time_features
+    lag_features = ['pv_production_lag_1', 'pv_production_lag_2', 'pv_production_lag_3', 'pv_production_lag_4', 'pv_production_lag_5', 'pv_production_lag_6', 'pv_production_lag_7', 'pv_production_lag_8', 'pv_production_lag_9', 'pv_production_lag_10', 'pv_production_lag_11', 'pv_production_lag_12', 'pv_production_lag_13', 'pv_production_lag_14', 'pv_production_lag_15', 'pv_production_lag_16', 'pv_production_lag_17', 'pv_production_lag_18', 'pv_production_lag_19', 'pv_production_lag_20', 'pv_production_lag_21', 'pv_production_lag_22', 'pv_production_lag_23', 'pv_production_lag_24']
+    selected_columns = core_weather_features + time_features + lag_features
 
     X_train, X_test, y_train, y_test, selected_columns =modeltrainer.prepare_data(train_data, test_data, selected_columns, 'pv_production')
 
     success, results = quick_validate_rf(X_train, X_test, y_train,y_test)
+    # results
+    #性能指标:
+    # 训练集 RMSE: 2.2050
+    # 测试集 RMSE: 4.8646
+    # 训练集 R²:  0.9802
+    # 测试集 R²:  0.7449
+    # 训练集 MAE: 0.9119
+    # 测试集 MAE: 1.9583
+   
+
+
+   # the decrease is a little bit dramatic, a little bit overfitting, I will tune the model to improve the performance
