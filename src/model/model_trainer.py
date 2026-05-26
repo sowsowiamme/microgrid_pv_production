@@ -1,3 +1,4 @@
+from importlib import import_module
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,15 +11,22 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 import warnings
+import os
+import statsmodels.stats.multitest as smm
+import scipy.stats as stats
+
+# from src.model.compare_and_tune_models import model_name
 warnings.filterwarnings('ignore')
+from sklearn.metrics import make_scorer, mean_squared_error
 
 # 机器学习相关
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.model_selection import (train_test_split, TimeSeriesSplit,
-                                     cross_val_score, GridSearchCV, RandomizedSearchCV)
+from sklearn.model_selection import (train_test_split, TimeSeriesSplit, KFold,
+                                     cross_val_score, GridSearchCV, RandomizedSearchCV,
+                                     ParameterGrid)
 from sklearn.metrics import (mean_squared_error, mean_absolute_error,
                              r2_score, explained_variance_score)
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
@@ -33,16 +41,23 @@ import matplotlib.pyplot as plt
 try:
     import xgboost as xgb
     XGB_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     XGB_AVAILABLE = False
-    logging.warning("XGBoost not available")
+    logging.warning("XGBoost not available: %s", exc)
 
 try:
     import lightgbm as lgb
     LGBM_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     LGBM_AVAILABLE = False
-    logging.warning("LightGBM not available")
+    logging.warning("LightGBM not available: %s", exc)
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class ModelTrainer:
     """
@@ -58,18 +73,41 @@ class ModelTrainer:
         """
         self.logger = logging.getLogger(__name__)
         self.logger.info("ModelTrainer 初始化完成")
+
+
         # 加载配置
         if config_path is None:
             # 默认配置路径
             project_root = Path(__file__).parent.parent.parent
             config_path = project_root / "config" / "model_config.yaml"
 
-        self.config = self._load_config(config_path)
+        raw_config = self._load_config(config_path)
+        self.config = raw_config
+        self.context = self._build_context()
+        self.config = self._resolve_config(raw_config)
         self.models = {}
         self.results = {}
         self.best_model = None
         self.best_model_name = None
-        self.scaler = StandardScaler()
+        # self.scaler = StandardScaler()
+
+        # # 获取CV配置
+        training_config = self.config.get('training', {})
+        self.cv_strategy = training_config.get('cv_strategy', 'timeseries')
+        self.cv_splits = int(training_config.get('cv_splits', 5))
+        self.random_state = int(training_config.get('random_state', self.context.get('random_state', 42)))
+        self.n_jobs = int(training_config.get('n_jobs', -1))
+        self.metrics = training_config.get('metrics', ['rmse', 'mae', 'r2', 'mape'])
+
+        # 获取CV分割器
+        self.cv = self._get_cv_strategy()
+
+        self.logger.info(
+        f"ModelTrainer 初始化完成 | "
+        f"CV策略: {self.cv_strategy} | "
+        f"折数: {self.cv_splits} | "
+        f"随机种子: {self.random_state}"
+        )
 
 
 
@@ -77,7 +115,7 @@ class ModelTrainer:
         """加载模型配置"""
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
+                config = yaml.safe_load(f) or {}
             self.logger.info(f"配置已从 {config_path} 加载")
             return config
         except Exception as e:
@@ -101,91 +139,117 @@ class ModelTrainer:
             'training': {
                 'test_size': 0.2,
                 'random_state': 42,
-                'cv_folds': 5
+                'cv_splits': 5,
+                'metrics': ['rmse', 'mae', 'r2', 'mape'],
+                'scoring': 'neg_mean_squared_error',
+                'n_jobs': -1,
             }
         }
 
-    def prepare_data(self, train_data: pd.DataFrame, test_data:pd.DataFrame,selected_columns:list, target_column: str) -> Tuple:
+    def prepare_data(
+        self,
+        train_data: pd.DataFrame,
+        test_data: Optional[pd.DataFrame] = None,
+        selected_columns: Optional[List[str]] = None,
+        target_column: str = 'pv_production',
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, List[str]]:
         """
-        准备训练数据
+        准备训练数据。
+
+        当前项目已经在数据层按时间拆好了 train/test，因此这里默认接收两份
+        DataFrame，避免在训练器内部再次随机切分导致时间泄漏。
 
         Args:
-            data: 包含特征和目标变量的完整数据集
+            train_data: 训练集
+            test_data: 测试集；如果不传，则按时间顺序从 train_data 尾部切出测试集
+            selected_columns: 显式选择的特征列；不传时使用除目标列外的数值列
             target_column: 目标变量列名
 
         Returns:
             (X_train, X_test, y_train, y_test, feature_columns)
         """
-        if target_column not in train_data.columns or target_column not in test_data.columns:
-            raise ValueError(f"目标列 '{target_column}' 不存在于数据中")
+        if target_column not in train_data.columns:
+            raise ValueError(f"目标列 '{target_column}' 不存在于训练集中")
 
-        # 确定特征列
-        # feature_columns = [col for col in data.columns if col != target_column]
+        if test_data is None:
+            test_size = float(self.config.get('training', {}).get('test_size', 0.2))
+            split_idx = int(len(train_data) * (1 - test_size))
+            test_data = train_data.iloc[split_idx:].copy()
+            train_data = train_data.iloc[:split_idx].copy()
+            self.logger.info(f"未传入测试集，按时间顺序切分: split_idx={split_idx}, test_size={test_size}")
 
-        X_train = train_data[selected_columns].copy()
-        y_train = train_data[target_column]
-        X_test = test_data[selected_columns].copy()
-        y_test = test_data[target_column]
+        if target_column not in test_data.columns:
+            raise ValueError(f"目标列 '{target_column}' 不存在于测试集中")
 
-        # # 分割数据
-        # test_size = self.config['training'].get('test_size', 0.2)
-        # random_state = self.config['training'].get('random_state', 42)
-        #
-        # X_train, X_test, y_train, y_test = train_test_split(
-        #     X, y, test_size=test_size, random_state=random_state, shuffle=False
-        # )
+        if selected_columns is None:
+            numeric_columns = train_data.select_dtypes(include=[np.number]).columns.tolist()
+            selected_columns = [col for col in numeric_columns if col != target_column]
+
+        missing_train = [col for col in selected_columns if col not in train_data.columns]
+        missing_test = [col for col in selected_columns if col not in test_data.columns]
+        if missing_train or missing_test:
+            raise ValueError(
+                f"特征列缺失: train_missing={missing_train}, test_missing={missing_test}"
+            )
+
+        feature_columns = list(selected_columns)
+        X_train = train_data[feature_columns].copy()
+        y_train = train_data[target_column].copy()
+        X_test = test_data[feature_columns].copy()
+        y_test = test_data[target_column].copy()
 
         self.logger.info(f"数据准备完成: 训练集={X_train.shape}, 测试集={X_test.shape}")
-        return X_train, X_test, y_train, y_test, selected_columns
+        return X_train, X_test, y_train, y_test, feature_columns
 
-    def _get_cv_strategy(self, n_splits: int = 5):
-        """获取交叉验证策略"""
-        cv_strategy = self.config['training'].get('cv_strategy', 'timeseries')
-
-        if cv_strategy == 'timeseries':
+    def _get_cv_strategy(self, cv_splits: Optional[int] = None):
+        """获取配置的交叉验证策略"""
+        n_splits = int(cv_splits or self.cv_splits)
+        strategy = str(self.cv_strategy).lower()
+        if strategy == 'timeseries':
+            logger.info(f"使用时间序列交叉验证 (n_splits={n_splits})")
             return TimeSeriesSplit(n_splits=n_splits)
+        elif strategy == 'kfold':
+            logger.info(
+                f"使用K-Fold交叉验证 (n_splits={n_splits}, "
+                f"random_state={self.random_state})"
+            )
+            return KFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=self.random_state
+            )
         else:
-            return n_splits  # 使用默认的KFold
+            raise ValueError(
+                f"不支持的CV策略: {self.cv_strategy}。"
+                "请选择 'timeseries' 或 'kfold'"
+            )
 
-    def _instantiate_model(self, model_config: Dict[str, Any]) -> BaseEstimator:
-        """实例化模型"""
-        model_class_path = model_config['class']
-
-        # 根据类路径实例化模型
-        if model_class_path == "sklearn.ensemble.RandomForestRegressor":
-            return RandomForestRegressor(random_state=42)
-        elif model_class_path == "sklearn.ensemble.GradientBoostingRegressor":
-            return GradientBoostingRegressor(random_state=42)
-        elif model_class_path == "sklearn.linear_model.LinearRegression":
-            return LinearRegression()
-        elif model_class_path == "sklearn.linear_model.Ridge":
-            return Ridge(random_state=42)
-        elif model_class_path == "sklearn.linear_model.Lasso":
-            return Lasso(random_state=42)
-        elif model_class_path == "sklearn.svm.SVR":
-            return SVR()
-        elif model_class_path == "sklearn.neighbors.KNeighborsRegressor":
-            return KNeighborsRegressor()
-        elif model_class_path == "xgboost.XGBRegressor" and XGB_AVAILABLE:
-            return xgb.XGBRegressor(random_state=42)
-        elif model_class_path == "lightgbm.LGBMRegressor" and LGBM_AVAILABLE:
-            return lgb.LGBMRegressor(random_state=42)
-        else:
-            raise ValueError(f"不支持的模型类: {model_class_path}")
-
-    def train_models(self, data: pd.DataFrame, target_column: str) -> Dict[str, Any]:
+    def train_models(
+        self,
+        train_data: pd.DataFrame,
+        test_data: Optional[pd.DataFrame] = None,
+        selected_columns: Optional[List[str]] = None,
+        target_column: str = 'pv_production',
+    ) -> Dict[str, Any]:
         """
         训练所有启用的模型
 
         Args:
-            data: 训练数据
+            train_data: 训练数据
+            test_data: 测试数据；不传时按时间顺序从 train_data 尾部切分
+            selected_columns: 特征列
             target_column: 目标变量列名
 
         Returns:
             训练结果字典
         """
         # 准备数据
-        X_train, X_test, y_train, y_test, feature_columns = self.prepare_data(data, target_column)
+        X_train, X_test, y_train, y_test, feature_columns = self.prepare_data(
+            train_data=train_data,
+            test_data=test_data,
+            selected_columns=selected_columns,
+            target_column=target_column,
+        )
 
         # 存储结果
         self.results = {
@@ -266,7 +330,7 @@ class ModelTrainer:
             ])
 
             # 获取参数网格
-            param_grid = model_config.get('param_grid', {})
+            param_grid = self._resolve_config(model_config.get('param_grid', {}))
 
             # 调整参数名（因为现在在管道中）
             param_grid_pipeline = {}
@@ -274,16 +338,18 @@ class ModelTrainer:
                 param_grid_pipeline[f'model__{param}'] = values
 
             # 交叉验证设置
-            cv_folds = model_config.get('cv_folds', 5)
-            cv = self._get_cv_strategy(cv_folds)
-            scoring = model_config.get('scoring', 'neg_mean_squared_error')
-            n_jobs = self.config['training'].get('n_jobs', -1)
+            cv_splits = model_config.get('cv_folds', self.cv_splits)
+            cv = self._get_cv_strategy(cv_splits)
+            training_config = self.config.get('training', {})
+            scoring = training_config.get('scoring', 'neg_mean_squared_error')
+            n_jobs = training_config.get('n_jobs', self.n_jobs)
+            grid_verbose = int(training_config.get('grid_search_verbose', 0))
 
             # 超参数调优
             self.logger.info(f"模型 {model_name}: 开始超参数搜索，参数组合数: {len(list(ParameterGrid(param_grid_pipeline)))}")
             grid_search = GridSearchCV(
                 pipeline, param_grid_pipeline,
-                cv=cv, scoring=scoring, n_jobs=n_jobs, verbose=0
+                cv=cv, scoring=scoring, n_jobs=n_jobs, verbose=grid_verbose
             )
 
             # 训练模型
@@ -301,7 +367,7 @@ class ModelTrainer:
             test_metrics = self._calculate_metrics(y_test, y_test_pred, "test")
 
             # 特征重要性（如果可用）
-            feature_importance = self._get_feature_importance(best_estimator, X_train.columns, model_name)
+            feature_importance = self._get_feature_importance(best_estimator, list(X_train.columns))
 
             # 记录训练结果
             self.logger.info(f"模型 {model_name} 训练完成")
@@ -313,7 +379,7 @@ class ModelTrainer:
             return {
                 'model_name': model_name,  # 在结果中包含模型名称
                 'best_estimator': best_estimator,
-                'best_params': grid_search.best_params_,
+                'best_params': {k.replace('model__', ''): v for k, v in grid_search.best_params_.items()},
                 'best_score': grid_search.best_score_,
                 'cv_results': self._simplify_cv_results(grid_search.cv_results_),
                 'train_metrics': train_metrics,
@@ -334,20 +400,21 @@ class ModelTrainer:
     def _calculate_metrics(self, y_true: pd.Series, y_pred: np.ndarray, dataset_type: str) -> Dict[str, float]:
         """计算评估指标"""
         metrics = {}
+        configured_metrics = self.metrics
 
-        if 'rmse' in self.config.get('metrics', []):
+        if 'rmse' in configured_metrics:
             metrics['rmse'] = np.sqrt(mean_squared_error(y_true, y_pred))
 
-        if 'mae' in self.config.get('metrics', []):
+        if 'mae' in configured_metrics:
             metrics['mae'] = mean_absolute_error(y_true, y_pred)
 
-        if 'r2' in self.config.get('metrics', []):
+        if 'r2' in configured_metrics:
             metrics['r2'] = r2_score(y_true, y_pred)
 
-        if 'mape' in self.config.get('metrics', []):
+        if 'mape' in configured_metrics:
             metrics['mape'] = self._mean_absolute_percentage_error(y_true, y_pred)
 
-        if 'explained_variance' in self.config.get('metrics', []):
+        if 'explained_variance' in configured_metrics:
             metrics['explained_variance'] = explained_variance_score(y_true, y_pred)
 
         return metrics
@@ -406,42 +473,6 @@ class ModelTrainer:
             comparison_data.append(row)
 
         self.results['comparison'] = pd.DataFrame(comparison_data)
-
-    def plot_model_comparison(self, metric: str = 'test_rmse', figsize: tuple = (12, 8)):
-        """绘制模型比较图"""
-        if 'comparison' not in self.results or self.results['comparison'].empty:
-            self.logger.warning("没有可用的比较数据")
-            return
-
-        df = self.results['comparison']
-
-        plt.figure(figsize=figsize)
-
-        # 根据指标排序
-        df_sorted = df.sort_values(metric)
-
-        models = df_sorted['model']
-        scores = df_sorted[metric]
-
-        bars = plt.barh(range(len(models)), scores)
-        plt.yticks(range(len(models)), models)
-        plt.xlabel(metric.upper())
-        plt.title(f'模型比较 - {metric.upper()}')
-
-        # 在条形上添加数值
-        for i, bar in enumerate(bars):
-            plt.text(bar.get_width(), bar.get_y() + bar.get_height()/2,
-                     f'{scores.iloc[i]:.4f}',
-                     ha='left', va='center', fontweight='bold')
-
-        plt.tight_layout()
-
-        # 保存图片
-        os.makedirs('reports/figures', exist_ok=True)
-        plt.savefig('reports/figures/model_comparison.png', dpi=300, bbox_inches='tight')
-        plt.close()
-
-        self.logger.info("模型比较图已保存")
 
     def plot_feature_importance(self, model_name: str = None, top_n: int = 15, figsize: tuple = (12, 8)):
         """绘制特征重要性图"""
@@ -556,3 +587,334 @@ class ModelTrainer:
             return pd.DataFrame()
 
         return self.results['comparison']
+
+    def save_inference_bundle(
+        self,
+        results: Dict[str, Any],
+        comparison_df: pd.DataFrame,
+        feature_columns: List[str],
+        target_column: str,
+        path: Optional[str] = None,
+    ) -> str:
+        """
+        将 Mean CV RMSE 排名第一的 Pipeline（含 StandardScaler）与特征元数据保存为 joblib，
+        供 Flask 等推理服务加载。
+        """
+        if path is None:
+            root = Path(__file__).resolve().parents[2]
+            path = str(root / "models" / "pv_inference_bundle.joblib")
+        model_col = "Model" if "Model" in comparison_df.columns else "model"
+        best_name = comparison_df.iloc[0][model_col]
+        best_result = results[best_name]
+        pipeline = best_result.get("best_model") or best_result.get("best_estimator")
+        if pipeline is None:
+            raise ValueError(f"结果中找不到可保存的模型: {best_name}")
+        bundle = {
+            "pipeline": pipeline,
+            "feature_columns": list(feature_columns),
+            "target_column": target_column,
+            "model_name": best_name,
+        }
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(bundle, path)
+        self.logger.info(f"推理模型包已保存: {path} (模型: {best_name})")
+        return path
+
+    def tune_and_evaluate_model(self,
+        model: BaseEstimator,
+        param_grid: Dict[str, Any],
+        model_name: str,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series
+    ) -> Dict[str, Any]:
+        """
+        时间序列安全的模型调优与评估。
+
+        1. 使用配置的CV策略进行超参数搜索
+        2. 在测试集上评估
+        3. 收集CV得分用于显著性检验
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🎯 开始训练和调优: {model_name}")
+        logger.info(f"{'='*60}")
+
+        try:
+            # 创建标准化管道
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('model', model)
+            ])
+
+            # 调整参数名以适应管道
+            param_grid_pipeline = {f'model__{k}': v for k, v in param_grid.items()}
+
+            # 获取训练配置
+            training_config = self.config.get('training', {})
+            scoring = training_config.get('scoring', 'neg_mean_squared_error')
+            n_jobs = self.n_jobs
+            grid_verbose = int(training_config.get('grid_search_verbose', 1))
+
+            n_combinations = len(ParameterGrid(param_grid_pipeline))
+            n_cv_folds = getattr(self.cv, 'n_splits', self.cv_splits)
+            logger.info(
+                f"  开始超参数搜索... 超参维度 {len(param_grid_pipeline)} 个, "
+                f"网格组合数 {n_combinations}, CV 折数 {n_cv_folds} "
+                f"(约 {n_combinations * n_cv_folds} 次带 CV 的拟合; 大数据集可能需数分钟至更久)"
+            )
+            if grid_verbose == 0:
+                logger.info(
+                    "  (当前 grid_search_verbose=0 无过程输出; "
+                    "可在 config/model_config.yaml 的 training 下设置 grid_search_verbose: 1)"
+                )
+
+            grid = GridSearchCV(
+                pipeline,
+                param_grid_pipeline,
+                cv=self.cv,
+                scoring=scoring,
+                n_jobs=n_jobs,
+                verbose=grid_verbose,
+            )
+            grid.fit(X_train, y_train)
+
+            best_model = grid.best_estimator_
+            best_params = {k.replace('model__', ''): v for k, v in grid.best_params_.items()}
+
+            # 测试集评估
+            y_pred = best_model.predict(X_test)
+            test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            test_mae = mean_absolute_error(y_test, y_pred)
+            test_r2 = r2_score(y_test, y_pred)
+
+            # 获取CV得分（用于显著性检验）
+            cv_scores = cross_val_score(
+                best_model,
+                X_train,
+                y_train,
+                cv=self.cv,
+                scoring=make_scorer(mean_squared_error, greater_is_better=False)
+            )
+            cv_rmses = np.sqrt(-cv_scores)
+
+            # 计算指标
+            train_pred = best_model.predict(X_train)
+            train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
+            train_mae = mean_absolute_error(y_train, train_pred)
+            train_r2 = r2_score(y_train, train_pred)
+
+            logger.info(f"  ✅ 训练完成!")
+            logger.info(f"    最佳参数: {best_params}")
+            logger.info(f"    测试集 R²: {test_r2:.4f}")
+            logger.info(f"    训练集 RMSE: {train_rmse:.4f}")
+            logger.info(f"    训练集 R²: {train_r2:.4f}")
+            logger.info(f"    测试集 RMSE: {test_rmse:.4f}")
+            logger.info(f"    平均 CV RMSE: {np.mean(cv_rmses):.4f} ± {np.std(cv_rmses):.4f}")
+
+            return {
+                'best_model': best_model,
+                'best_params': best_params,
+                'test_rmse': test_rmse,
+                'test_mae': test_mae,
+                'test_r2': test_r2,
+                'train_rmse': train_rmse,
+                'train_mae': train_mae,
+                'train_r2': train_r2,
+                'cv_rmses': cv_rmses,
+                'mean_cv_rmse': np.mean(cv_rmses),
+                'std_cv_rmse': np.std(cv_rmses),
+                'y_pred': y_pred,
+                'y_true': y_test
+            }
+
+        except Exception as e:
+            logger.error(f"❌ {model_name} 训练失败: {str(e)}")
+            raise
+
+    def _build_context(self) -> Dict[str, Any]:
+        """构建变量上下文（用于替换 ${xxx}）"""
+        import multiprocessing
+        n_jobs_config = self.config.get('global', {}).get('n_jobs', -1)
+        n_jobs = multiprocessing.cpu_count() if n_jobs_config == -1 else n_jobs_config
+        return {
+            'n_jobs': n_jobs,
+            'random_state': self.config.get('global', {}).get('random_state', 42)
+        }
+    def _resolve_value(self, value: Any) -> Any:
+        """解析变量（支持${xxx}）"""
+        if isinstance(value, str):
+            if value.startswith('${') and value.endswith('}'):
+                key = value[2:-1]
+                if key in self.context:
+                    return self.context[key]
+        return value
+
+
+    def _resolve_config(self, obj: Any) -> Any:
+        """递归解析配置中的占位符"""
+        if isinstance(obj, dict):
+            return {k: self._resolve_config(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._resolve_config(item) for item in obj]
+        elif isinstance(obj, str) and obj.startswith('${') and obj.endswith('}'):
+            key = obj[2:-1].strip()
+            if key in self.context:
+                return self.context[key]
+            else:
+                logger.warning(f"⚠️  未定义的变量: ${key}，保留原值")
+                return obj  # 保留原字符串但警告
+        else:
+            return obj  # 非字符串/非占位符直接返回
+
+    def _instantiate_model(self, model_config: Dict[str, Any]) -> BaseEstimator:
+        resolved_config = self._resolve_config(model_config)
+        class_path = resolved_config['class']
+        init_params = resolved_config.get('init_params', {})
+        try:
+            model_path, model_name = class_path.rsplit('.',1)
+            module = import_module(model_path)
+            ModuleClass = getattr(module, model_name)
+            model = ModuleClass(**init_params)
+            return model
+        except Exception as e:
+            logger.error(f"❌ 模型初始化失败 ({class_path}): {str(e)}")
+            raise
+
+
+    def compare_models_with_significance(
+        self,
+        results: Dict[str, Dict[str, Any]],
+        alpha: float = 0.05,
+        save_path: Optional[str] = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        模型显著性比较
+        1. 生成性能对比表
+        2. 执行配对t检验（单侧）
+        3. 识别统计显著的差异
+
+        Args:
+            results: tune_and_evaluate_model 返回的结果字典
+            alpha: 显著性水平 (默认 0.05)
+            save_path: 保存结果的路径
+
+        Returns:
+            (comparison_df, p_value_matrix)
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info("📊 模型显著性比较")
+        logger.info(f"{'='*60}")
+
+        model_names = list(results.keys())
+        n_models = len(model_names)
+
+        # 构建性能比较表
+        records = []
+        cv_rmses_dict = {}
+
+        for name, res in results.items():
+            records.append({
+                'Model': name,
+                'Test RMSE': res['test_rmse'],
+                'Train RMSE': res['train_rmse'],
+                'Mean CV RMSE': res['mean_cv_rmse'],
+                'Std CV RMSE': res['std_cv_rmse']
+            })
+            cv_rmses_dict[name] = res['cv_rmses']
+
+        comparison_df = pd.DataFrame(records).sort_values('Mean CV RMSE').reset_index(drop=True)
+
+        # 构建p-value矩阵
+        p_value_matrix = pd.DataFrame(
+            np.ones((n_models, n_models)),
+            index=model_names,
+            columns=model_names
+        )
+
+        # 配对t检验（单侧：我们关心A是否显著优于B）
+        logger.info(f"\n🔍 配对t检验 (α={alpha}, 单侧检验):")
+        for i, model_a in enumerate(model_names):
+            for j, model_b in enumerate(model_names):
+                if i >= j:
+                    continue
+
+                try:
+                    # ttest_rel 返回双侧p值，我们除以2得到单侧
+                    t_stat, p_val = stats.ttest_rel(
+                        cv_rmses_dict[model_a],
+                        cv_rmses_dict[model_b]
+                    )
+                    p_val_one_sided = p_val / 2 if t_stat < 0 else 1 - (p_val / 2)
+
+                    p_value_matrix.loc[model_a, model_b] = p_val_one_sided
+                    p_value_matrix.loc[model_b, model_a] = p_val_one_sided
+
+                    # 格式化输出
+                    better = model_a if np.mean(cv_rmses_dict[model_a]) < np.mean(cv_rmses_dict[model_b]) else model_b
+                    worse = model_b if better == model_a else model_a
+
+                    if p_val_one_sided < alpha:
+                        logger.info(
+                            f"✅ {better} 显著优于 {worse} "
+                            f"(p={p_val_one_sided:.4f})"
+                        )
+                    else:
+                        logger.info(
+                            f"⚠️  {better} 与 {worse} 无显著差异 "
+                            f"(p={p_val_one_sided:.4f})"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"⚠️  {model_a} vs {model_b} 检验失败: {str(e)}")
+                    p_value_matrix.loc[model_a, model_b] = 1.0
+                    p_value_matrix.loc[model_b, model_a] = 1.0
+
+        # 保存结果
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            comparison_df.to_csv(f"{save_path}_comparison.csv", index=False)
+            p_value_matrix.to_csv(f"{save_path}_pvalues.csv")
+            logger.info(f"结果已保存到: {save_path}")
+
+        return comparison_df, p_value_matrix
+
+
+    def plot_model_comparison(
+        self,
+        comparison_df: pd.DataFrame,
+        metric: str = 'Mean CV RMSE',
+        figsize: Tuple[int, int] = (12, 8),
+        save_path: str = 'reports/figures/model_comparison.png'
+    ):
+        if comparison_df.empty:
+            logger.warning("没有可绘制的模型比较数据")
+            return
+        if metric not in comparison_df.columns:
+            raise ValueError(f"比较表中不存在指标列: {metric}")
+
+        # 按指标排序
+        df_sorted = comparison_df.sort_values(metric)
+        model_col = 'Model' if 'Model' in df_sorted.columns else 'model'
+        models = df_sorted[model_col]
+        scores = df_sorted[metric]
+
+        # 创建水平条形图
+        plt.figure(figsize=figsize)
+        bars = plt.barh(range(len(models)), scores, color='skyblue')
+        plt.yticks(range(len(models)), models)
+        plt.xlabel(metric)
+        plt.title(f'Model Comparison - {metric}')
+        plt.gca().invert_yaxis()
+
+        # 在条形上添加数值
+        for i, bar in enumerate(bars):
+            plt.text(
+                bar.get_width() + 0.01,
+                bar.get_y() + bar.get_height()/2,
+                f'{scores.iloc[i]:.4f}'),
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"📊 模型比较图已保存到: {save_path}")
